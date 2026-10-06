@@ -339,6 +339,39 @@ def test_superseded_lease_releases_slot_without_revoking(client):
     assert conflict.status_code == 409 and conflict.json()["detail"]["reason"] == "superseded"
 
 
+def test_superseded_lease_frees_slot_and_reclaim_takes_it_back(client):
+    # 长期租约被同序号 temporary_failure 直接回执取代：名额立即释放（同域 bob 可领）；
+    # alice 退避到后虽旧租约未期满也可重领，但须重新占用域名名额（在途满时仍跳过）。
+    setup(client)
+    set_limit(client, "mail.example.com", 1)
+    submit(client, "msg-a", "multi@corp.example.com")  # alice, bob（同域）
+    old = next(t for t in claim(client, lease_seconds=3600).json()["tasks"]
+               if t["mailbox"] == "alice@mail.example.com")
+    assert claim(client).json()["tasks"] == []  # alice 在途占名额，bob 被跳过
+    receipt = client.post("/deliveries/msg-a/receipts", json={
+        "mailbox": "alice@mail.example.com", "attempt_no": 1, "result": "temporary_failure",
+    })
+    assert receipt.status_code == 200
+    # 名额已释放：bob 可领；alice 退避未到且旧租约虽在也不再阻塞
+    tasks = claim(client).json()["tasks"]
+    assert pairs(tasks) == {("msg-a", "bob@mail.example.com")}
+    token_bob = tasks[0]["token"]
+    # alice 退避已到（60 秒）：可重领，但同域名额正被 bob 占用 → 仍跳过
+    conn = db.connect()
+    conn.execute(
+        "UPDATE delivery_attempts SET created_at = "
+        "strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', '-60 seconds') "
+        "WHERE delivery_id = 'msg-a' AND mailbox = 'alice@mail.example.com'"
+    )
+    conn.close()
+    assert claim(client).json()["tasks"] == []
+    # bob 完成后名额释放：alice 以序号 2 重领（旧租约未期满也轮换令牌）
+    assert complete(client, token_bob, "delivered").status_code == 200
+    tasks = claim(client).json()["tasks"]
+    assert pairs(tasks) == {("msg-a", "alice@mail.example.com")}
+    assert tasks[0]["attempt_no"] == 2 and tasks[0]["token"] != old["token"]
+
+
 # ---------- 调低 / 调高 / 删除上限的行为 ----------
 
 def test_lowering_limit_keeps_tokens_but_blocks_new_claims(client):

@@ -84,6 +84,9 @@
   到期（下一序号 +1）；最新回执为 `delivered` / `permanent_failure` 的终点**不再入列**；
   路由失败判定没有终点，从不入列。核对与领取在单个 `BEGIN IMMEDIATE` 事务内完成：
   **并发领取不会重复分配有效租约**；到期终点可被重新领取且**旧令牌立即失效**。
+  **已被不早于租约序号的回执取代的租约行视为失效**：不再阻塞入列，该终点按最新回执
+  重算到期时刻与下一尝试序号（退避未到不返回，到期即可重领并轮换令牌），不会把
+  已被直接回执取代的重试拖延到旧租约期满。
   凭有效令牌调 `POST /deliveries/claims/{token}/complete` 提交既有三种回执结果之一时，
   **原子写入回执并结束租约**；若既有回执接口（`POST /deliveries/{id}/receipts`）已先为该
   终点记录了不早于租约序号的新回执，**令牌失效且不得覆盖**。过期、已结束、被新回执抢先或
@@ -944,14 +947,25 @@ curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: applicati
 退避序列为 60、120、240、480、960、1920、3600、3600…（**第 7 次暂时失败起封顶 3600 秒**）。
 已被操作方撤销的终点任务（见章节 25–26）同样不再入列。
 
+**被回执取代的租约不再阻塞入列**：若既有回执接口已先为某终点记录了不早于租约序号的
+回执（`attempt_no >= 租约序号`），该租约行即使尚未到期也视为失效——领取时按**最新回执**
+重算该终点的到期时刻与下一尝试序号：退避未到不返回，退避一到即可重领并轮换令牌，
+不会把这次重试拖延到旧租约期满；若取代回执是终结结果（`delivered` / `permanent_failure`），
+该终点按上表规则**不再入列**。
+
 ### 20. 并发领取与到期重领
 
 - **不重复分配有效租约**：领取的“扫描 + 写租约”在单个 `BEGIN IMMEDIATE` 事务内完成，
   并发 / 批量领取由写锁串行化；一个未结束且未到期的租约对应的终点不会出现在任何其他
   领取结果中。紧接着的第二次领取只会返回**新的**到期项（上例再次调用返回 `{"tasks": []}`）。
+  有效租约 = 未结束、未到期、且**未被不早于租约序号的回执取代**——租约序号高于该终点
+  最新回执序号时（回执尚未取代租约），租约依然有效，不会被重复分配。
 - **到期可重领，旧令牌立即失效**：到达 `lease_expires_at` 仍未回执的租约不再视为有效，
   该终点可以被任意调用方重新领取；重领时服务为该终点轮换租约行（**新令牌、新到期时刻**），
   此后持旧令牌的提交一律报冲突。
+- **被取代租约的提前重领**：租约被直接回执取代后无需等到租约期满——该终点按最新回执
+  退避到期即可重领，同样轮换令牌；旧令牌在重领前提交报 `superseded`，重领后报
+  `unknown`，两种情形都**不会覆盖既有回执**。
 - 领取本身**不写回执**，对判定、策略、报表、熔断没有任何影响。
 
 ### 21. 凭令牌提交回执（POST /deliveries/claims/{token}/complete）
@@ -1015,6 +1029,52 @@ while true; do
   done
   sleep 5
 done
+```
+
+### 22.1 本轮变动：被直接回执取代的租约不再阻塞重试（漏领修复）
+
+**问题**：终点领到长期租约（如 3600 秒）后，投递系统绕过租约、经
+`POST /deliveries/{id}/receipts` 先写入了**同序号的 `temporary_failure`**——原令牌随即
+失效（提交报 `superseded`），但旧的领取逻辑只按“未结束且未到期”判断租约有效性，
+即使该回执的退避时间已到，领取仍被这条未到期的租约行挡住而返回空列表，
+重试被无谓地延迟到旧租约期满。
+
+**修复**：领取时把**已被不早于租约序号的回执取代**的租约行视为失效，不再阻塞入列；
+该终点的到期时刻与下一尝试序号一律按**最新回执**重算。行为要点：
+
+- 退避未到时仍不返回（不会因为租约失效而提前发任务）；
+- 退避一到即可重领，重领照常**轮换令牌**（新令牌、新到期时刻）；
+- 旧令牌提交仍按既有冲突处理：重领前报 `superseded`、重领（行轮换）后报 `unknown`，
+  两种情形都**不会覆盖既有回执**；
+- 取代回执为 `delivered` / `permanent_failure`（终结）时，该终点**不再入列**；
+- 有效租约不重复分配、域名在途上限（被取代的租约本就不占名额，重领后重新占用）
+  与撤销拦截的行为完全不变。
+
+调用示例（沿用上文已提交的 `msg-2026-10-05-1001` 判定）：
+
+```bash
+# 1) 领到 3600 秒长期租约（attempt_no = 1）
+curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 3600}'
+# => {"tasks": [{"delivery_id": "msg-2026-10-05-1001", "mailbox": "alice@mail.example.com",
+#      "attempt_no": 1, "token": "3caeded1…", ...}]}
+
+# 2) 投递系统绕过租约，直接回执同序号暂时失败（原令牌随即失效）
+curl -X POST http://localhost:8000/deliveries/msg-2026-10-05-1001/receipts \
+  -H 'Content-Type: application/json' \
+  -d '{"mailbox": "alice@mail.example.com", "attempt_no": 1, "result": "temporary_failure"}'
+
+# 3) 旧令牌提交 → 409 superseded，既有回执不被覆盖
+curl -X POST http://localhost:8000/deliveries/claims/3caeded1…/complete \
+  -H 'Content-Type: application/json' -d '{"result": "delivered"}'
+# => 409 {"detail": {"error": "invalid_lease_token", "reason": "superseded", ...}}
+
+# 4) 该回执的退避（60 秒）一到——不必等旧租约的 3600 秒期满——即可重领：
+#    下一尝试序号 2，令牌轮换
+curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 300}'
+# => {"tasks": [{"delivery_id": "msg-2026-10-05-1001", "mailbox": "alice@mail.example.com",
+#      "attempt_no": 2, "token": "a0f2db10…", ...}]}
 ```
 
 ## 按终点邮箱域名限制同时在途领取数

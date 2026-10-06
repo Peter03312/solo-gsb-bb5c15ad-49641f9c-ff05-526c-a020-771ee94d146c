@@ -880,13 +880,16 @@ def receipt_summary(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
 # - 最新（序号最大）回执为 temporary_failure：到期时刻 = 该回执时刻 +
 #   min(60×2^(尝试序号−1), 3600) 秒，下一尝试序号 = 该回执序号 + 1；
 # - 最新回执为 delivered / permanent_failure：终结，永不入列。
-# 每个 (投递编号, 终点) 至多一行租约：未结束且未到期的租约为“有效租约”，
-# 不参与领取；领取（含到期重领）整体轮换该行——新令牌、新序号、新到期时刻，
-# completed_at/result 复位——因此旧令牌立即失效。凭有效令牌提交既有三种回执
-# 结果时，在同一事务内原子写入 delivery_attempts 并结束租约；若既有回执接口
-# 先为该终点记录了 attempt_no >= 租约序号的新回执（按序号规则必然是更晚的
-# 尝试），令牌失效且不得覆盖。全部“核对 + 写入”在单个 BEGIN IMMEDIATE
-# 事务内完成，并发领取串行化，同一终点的有效租约不会被重复分配。
+# 每个 (投递编号, 终点) 至多一行租约：未结束、未到期且未被回执取代的租约为
+# “有效租约”，不参与领取；领取（含到期重领）整体轮换该行——新令牌、新序号、
+# 新到期时刻，completed_at/result 复位——因此旧令牌立即失效。凭有效令牌提交
+# 既有三种回执结果时，在同一事务内原子写入 delivery_attempts 并结束租约；
+# 若既有回执接口先为该终点记录了 attempt_no >= 租约序号的新回执（按序号规则
+# 必然是更晚的尝试），令牌失效且不得覆盖。这样的租约行在领取时同样视为失效：
+# 不再阻塞该终点入列，到期时刻与下一尝试序号一律按最新回执重算（退避未到
+# 不返回，到期后重领并轮换令牌），避免长期租约把已被直接回执取代的重试拖延
+# 到旧租约期满。全部“核对 + 写入”在单个 BEGIN IMMEDIATE 事务内完成，
+# 并发领取串行化，同一终点的有效租约不会被重复分配。
 
 
 def backoff_delay_seconds(attempt_no: int) -> int:
@@ -922,13 +925,16 @@ def claim_due_tasks(
     须在 BEGIN IMMEDIATE 写事务内调用：并发领取串行化，同一终点的有效租约
     不会被重复分配。按到期时刻、投递编号、终点稳定排序后取前 max_claims 个，
     每项返回投递编号、终点、下一尝试序号、到期时刻、租约到期时刻与租约令牌。
-    暂无到期项返回空列表。
+    到期时刻与下一尝试序号一律按该终点最新回执重算；已被不早于租约序号的
+    回执取代的租约行视为失效，不再阻塞入列（退避未到仍不返回）。暂无到期项
+    返回空列表。
     """
     current = now or datetime.now(timezone.utc)
     now_text = current.isoformat(timespec="seconds")
 
     # 成功判定的全部终点 × 该终点最新（序号最大）回执（无回执则最新侧为 NULL）；
-    # 已有有效租约（未结束且未到期）的终点与已撤销的终点直接排除。退避到期在 Python 侧计算。
+    # 已有有效租约（未结束、未到期且未被不早于租约序号的回执取代）的终点与已撤销
+    # 的终点直接排除。退避到期在 Python 侧计算。
     rows = conn.execute(
         """
         SELECT d.delivery_id,
@@ -953,6 +959,12 @@ def claim_due_tasks(
                 WHERE l.delivery_id = d.delivery_id
                   AND l.mailbox = json_extract(je.value, '$.mailbox')
                   AND l.completed_at IS NULL AND l.lease_expires_at > ?
+                  AND NOT EXISTS (
+                        SELECT 1 FROM delivery_attempts sa
+                        WHERE sa.delivery_id = l.delivery_id
+                          AND sa.mailbox = l.mailbox
+                          AND sa.attempt_no >= l.attempt_no
+                  )
           )
           AND NOT EXISTS (
                 SELECT 1 FROM delivery_endpoint_revocations r

@@ -4,8 +4,10 @@
 temporary_failure 按 min(60×2^(尝试序号−1),3600) 秒退避到期，下一序号 +1；
 delivered / permanent_failure 不再入列。按到期时刻、投递编号、终点稳定排序。
 并发领取经 BEGIN IMMEDIATE 串行化，不重复分配有效租约；到期可重领且旧令牌失效；
-凭有效令牌原子写入回执并结束租约；既有回执接口先记录新回执时令牌失效且不覆盖；
-过期 / 失效 / 未知令牌报 409；参数非法 422；无到期项返回空列表。
+凭有效令牌原子写入回执并结束租约；既有回执接口先记录新回执时令牌失效且不覆盖，
+且被不早于租约序号的回执取代的租约行不再阻塞入列（按最新回执重算到期与序号，
+退避未到不返回，到期即可重领并轮换令牌）；过期 / 失效 / 未知令牌报 409；
+参数非法 422；无到期项返回空列表。
 既有回执接口、判定查询 / 重放与熔断统计的约定不变。
 """
 import os
@@ -474,6 +476,95 @@ def test_later_attempt_via_existing_api_supersedes_lease(client):
     assert resp.status_code == 200
     conflict = complete(client, token, "delivered")
     assert conflict.status_code == 409 and conflict.json()["detail"]["reason"] == "superseded"
+
+
+# ---------- 被直接回执取代的租约不再阻塞入列（漏领修复） ----------
+
+def test_superseded_lease_does_not_delay_retry_until_lease_expiry(client):
+    # 长期租约（3600 秒）+ 既有回执接口先写入同序号 temporary_failure：租约行未到期
+    # 但已被取代——退避未到不返回，退避一到即可按最新回执重领（下一序号 +1、令牌轮换），
+    # 不再拖延到旧租约期满。
+    setup(client)
+    submit(client, "msg-1", "single@corp.example.com")  # carol 单终点
+    old = claim(client, lease_seconds=3600).json()["tasks"][0]
+    assert old["attempt_no"] == 1
+    resp = client.post("/deliveries/msg-1/receipts", json={
+        "mailbox": "carol@mail.example.com", "attempt_no": 1, "result": "temporary_failure",
+    })
+    assert resp.status_code == 200
+    # 旧令牌在重领前提交 → superseded，不覆盖既有回执
+    conflict = complete(client, old["token"], "delivered")
+    assert conflict.status_code == 409 and conflict.json()["detail"]["reason"] == "superseded"
+    # 退避未到（30 秒 < 60 秒）：不返回
+    shift_attempt_ago("msg-1", "carol@mail.example.com", 30)
+    assert claim(client).json()["tasks"] == []
+    # 退避已到（90 秒 > 60 秒）：旧租约远未期满仍可重领，下一序号为 2，令牌轮换
+    shift_attempt_ago("msg-1", "carol@mail.example.com", 90)
+    tasks = claim(client).json()["tasks"]
+    assert len(tasks) == 1
+    assert tasks[0]["attempt_no"] == 2 and tasks[0]["token"] != old["token"]
+    # 旧令牌已被轮换：提交报 unknown，且不覆盖既有回执
+    again = complete(client, old["token"], "delivered")
+    assert again.status_code == 409 and again.json()["detail"]["reason"] == "unknown"
+    ep = client.get("/deliveries/msg-1/receipts").json()["endpoints"][0]
+    assert [a["result"] for a in ep["attempts"]] == ["temporary_failure"]
+    # 新令牌正常完成（序号 2），回执查询立即可见
+    done = complete(client, tasks[0]["token"], "delivered")
+    assert done.status_code == 200 and done.json()["attempt_no"] == 2
+    assert client.get("/deliveries/msg-1/receipts").json()["status"] == "delivered"
+
+
+def test_superseded_terminal_receipt_never_relisted(client):
+    # 长期租约 + 既有回执接口先写入同序号 delivered（终结）：终点不再入列
+    setup(client)
+    submit(client, "msg-1", "single@corp.example.com")
+    old = claim(client, lease_seconds=3600).json()["tasks"][0]
+    resp = client.post("/deliveries/msg-1/receipts", json={
+        "mailbox": "carol@mail.example.com", "attempt_no": 1, "result": "delivered",
+    })
+    assert resp.status_code == 200
+    assert claim(client).json()["tasks"] == []
+    conflict = complete(client, old["token"], "temporary_failure")
+    assert conflict.status_code == 409 and conflict.json()["detail"]["reason"] == "superseded"
+    ep = client.get("/deliveries/msg-1/receipts").json()["endpoints"][0]
+    assert [a["result"] for a in ep["attempts"]] == ["delivered"]
+
+
+def test_lease_with_attempt_ahead_of_receipts_still_blocks(client):
+    # 租约序号高于最新回执序号（回执未取代租约）时仍是有效租约：不重复分配
+    setup(client)
+    submit(client, "msg-1", "single@corp.example.com")
+    first = claim(client).json()["tasks"][0]
+    assert complete(client, first["token"], "temporary_failure").status_code == 200
+    # 退避到后重领：租约序号为 2，最新回执序号为 1（< 2，未取代租约）
+    shift_attempt_ago("msg-1", "carol@mail.example.com", 60)
+    second = claim(client, lease_seconds=3600).json()["tasks"][0]
+    assert second["attempt_no"] == 2
+    # 有效租约未到期：再次领取返回空；新令牌可正常完成
+    assert claim(client).json()["tasks"] == []
+    assert complete(client, second["token"], "delivered").status_code == 200
+
+
+def test_superseded_lease_reclaim_uses_latest_receipt_attempt(client):
+    # 既有接口连续写入两个回执（同租约序号与更晚跳号）：重领按最新回执计算序号与退避
+    setup(client)
+    submit(client, "msg-1", "single@corp.example.com")
+    old = claim(client, lease_seconds=3600).json()["tasks"][0]  # 租约序号 1
+    for attempt_no in (1, 2):
+        resp = client.post("/deliveries/msg-1/receipts", json={
+            "mailbox": "carol@mail.example.com",
+            "attempt_no": attempt_no,
+            "result": "temporary_failure",
+        })
+        assert resp.status_code == 200
+    # 最新回执为 attempt 2：退避 120 秒，60 秒不可领
+    shift_attempt_ago("msg-1", "carol@mail.example.com", 60)
+    assert claim(client).json()["tasks"] == []
+    # 180 秒到：下一序号为 3
+    shift_attempt_ago("msg-1", "carol@mail.example.com", 180)
+    tasks = claim(client).json()["tasks"]
+    assert len(tasks) == 1 and tasks[0]["attempt_no"] == 3
+    assert tasks[0]["token"] != old["token"]
 
 
 # ---------- 与既有功能解耦：查询、重放、熔断不受影响 ----------
