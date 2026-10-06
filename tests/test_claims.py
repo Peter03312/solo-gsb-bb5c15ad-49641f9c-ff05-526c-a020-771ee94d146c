@@ -476,6 +476,84 @@ def test_later_attempt_via_existing_api_supersedes_lease(client):
     assert conflict.status_code == 409 and conflict.json()["detail"]["reason"] == "superseded"
 
 
+# ---------- 漏领修复：未到期租约被同序号回执取代后按退避重领，不拖到租约期满 ----------
+
+def _alice_task(client):
+    return next(t for t in claim(client).json()["tasks"]
+                if t["mailbox"] == "alice@mail.example.com")
+
+
+def test_superseded_unexpired_lease_reclaimable_when_backoff_due(client):
+    setup(client)
+    submit(client, "msg-x", "multi@corp.example.com")  # alice, bob
+    # 先把 bob 的租约结束掉避免干扰
+    first = {t["mailbox"]: t for t in claim(client).json()["tasks"]}
+    assert set(first) == {"alice@mail.example.com", "bob@mail.example.com"}
+    old_token = first["alice@mail.example.com"]["token"]
+    # 领取后回执接口直接写入同序号 attempt 1 temporary_failure：原令牌立即失效
+    resp = client.post("/deliveries/msg-x/receipts", json={
+        "mailbox": "alice@mail.example.com", "attempt_no": 1, "result": "temporary_failure",
+    })
+    assert resp.status_code == 200
+    # 旧令牌提交按既有冲突处理（superseded），且不覆盖回执
+    conflict = complete(client, old_token, "delivered")
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reason"] == "superseded"
+
+    # 退避未到（59s）：即便长租约（lease_seconds=3600）未到期，也不得返回
+    shift_attempt_ago("msg-x", "alice@mail.example.com", 59)
+    assert [t for t in claim(client, lease_seconds=3600).json()["tasks"]
+            if (t["delivery_id"], t["mailbox"]) == ("msg-x", "alice@mail.example.com")] == []
+    # 退避到点：无需等旧租约期满即可重领，序号推进到 2、令牌轮换。
+    # 用 61s（而非恰为 60s 的边界）消除“写回执与领取跨秒”的时间抖动。
+    shift_attempt_ago("msg-x", "alice@mail.example.com", 61)
+    task2 = next(t for t in claim(client, lease_seconds=3600).json()["tasks"]
+                 if (t["delivery_id"], t["mailbox"]) == ("msg-x", "alice@mail.example.com"))
+    assert task2["attempt_no"] == 2 and task2["token"] != old_token
+    # 行已轮换：旧令牌再提交变为 unknown；新令牌可完成，attempt 1 的 temp failure 保留
+    again = complete(client, old_token, "delivered")
+    assert again.status_code == 409 and again.json()["detail"]["reason"] == "unknown"
+    assert complete(client, task2["token"], "delivered").status_code == 200
+    ep = next(e for e in client.get("/deliveries/msg-x/receipts").json()["endpoints"]
+              if e["mailbox"] == "alice@mail.example.com")
+    assert [(a["attempt_no"], a["result"]) for a in ep["attempts"]] == [
+        (1, "temporary_failure"), (2, "delivered"),
+    ]
+
+
+def test_superseded_unexpired_lease_with_terminal_receipt_never_enqueued(client):
+    setup(client)
+    submit(client, "msg-1")
+    old_token = _alice_task(client)["token"]
+    # 同序号终结回执直接写入：被取代的未到期租约不阻塞，但终点终结，永不入列
+    assert client.post("/deliveries/msg-1/receipts", json={
+        "mailbox": "alice@mail.example.com", "attempt_no": 1, "result": "permanent_failure",
+    }).status_code == 200
+    assert complete(client, old_token, "delivered").json()["detail"]["reason"] == "superseded"
+    assert [t for t in claim(client, lease_seconds=3600).json()["tasks"]
+            if (t["delivery_id"], t["mailbox"]) == ("msg-1", "alice@mail.example.com")] == []
+    # 即使把回执前移很久，终结回执仍不入列
+    shift_attempt_ago("msg-1", "alice@mail.example.com", 9999)
+    assert [t for t in claim(client, lease_seconds=3600).json()["tasks"]
+            if (t["delivery_id"], t["mailbox"]) == ("msg-1", "alice@mail.example.com")] == []
+
+
+def test_superseded_unexpired_lease_does_not_double_allocate(client):
+    setup(client)
+    submit(client, "msg-1")
+    old_token = _alice_task(client)["token"]
+    assert client.post("/deliveries/msg-1/receipts", json={
+        "mailbox": "alice@mail.example.com", "attempt_no": 1, "result": "temporary_failure",
+    }).status_code == 200
+    shift_attempt_ago("msg-1", "alice@mail.example.com", 61)
+    # 连续两次领取：第一次重领 alice（轮换），第二次该终点已有新的有效租约，不得重复
+    first = [t for t in claim(client).json()["tasks"]
+             if (t["delivery_id"], t["mailbox"]) == ("msg-1", "alice@mail.example.com")]
+    assert len(first) == 1 and first[0]["token"] != old_token
+    assert [t for t in claim(client).json()["tasks"]
+            if (t["delivery_id"], t["mailbox"]) == ("msg-1", "alice@mail.example.com")] == []
+
+
 # ---------- 与既有功能解耦：查询、重放、熔断不受影响 ----------
 
 def test_claims_do_not_change_decisions_or_replay(client):

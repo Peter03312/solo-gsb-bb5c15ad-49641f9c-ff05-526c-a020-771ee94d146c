@@ -880,13 +880,16 @@ def receipt_summary(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
 # - 最新（序号最大）回执为 temporary_failure：到期时刻 = 该回执时刻 +
 #   min(60×2^(尝试序号−1), 3600) 秒，下一尝试序号 = 该回执序号 + 1；
 # - 最新回执为 delivered / permanent_failure：终结，永不入列。
-# 每个 (投递编号, 终点) 至多一行租约：未结束且未到期的租约为“有效租约”，
-# 不参与领取；领取（含到期重领）整体轮换该行——新令牌、新序号、新到期时刻，
-# completed_at/result 复位——因此旧令牌立即失效。凭有效令牌提交既有三种回执
-# 结果时，在同一事务内原子写入 delivery_attempts 并结束租约；若既有回执接口
-# 先为该终点记录了 attempt_no >= 租约序号的新回执（按序号规则必然是更晚的
-# 尝试），令牌失效且不得覆盖。全部“核对 + 写入”在单个 BEGIN IMMEDIATE
-# 事务内完成，并发领取串行化，同一终点的有效租约不会被重复分配。
+# 每个 (投递编号, 终点) 至多一行租约：未结束且未到期、且未被“不早于租约序号”
+# 的既有回执取代的租约才是“有效租约”，不参与领取；领取（含到期重领）整体轮换
+# 该行——新令牌、新序号、新到期时刻，completed_at/result 复位——因此旧令牌立即
+# 失效。典型漏领链路：终点领到长租约后，回执接口直接写入同序号 temporary_failure，
+# 原令牌随即失效；此时即便该长租约尚未到期，只要退避已到即可按最新回执重领
+# （退避未到仍不返回），无需等到旧租约期满。凭有效令牌提交既有三种回执结果时，
+# 在同一事务内原子写入 delivery_attempts 并结束租约；若既有回执接口先为该终点
+# 记录了 attempt_no >= 租约序号的新回执（按序号规则必然是更晚的尝试），令牌失效
+# 且不得覆盖。全部“核对 + 写入”在单个 BEGIN IMMEDIATE 事务内完成，并发领取
+# 串行化，同一终点的有效租约不会被重复分配。
 
 
 def backoff_delay_seconds(attempt_no: int) -> int:
@@ -928,7 +931,9 @@ def claim_due_tasks(
     now_text = current.isoformat(timespec="seconds")
 
     # 成功判定的全部终点 × 该终点最新（序号最大）回执（无回执则最新侧为 NULL）；
-    # 已有有效租约（未结束且未到期）的终点与已撤销的终点直接排除。退避到期在 Python 侧计算。
+    # 已有有效租约（未结束、未到期且未被不早于租约序号的回执取代）的终点与已撤销
+    # 的终点直接排除；租约被取代（如回执接口直接写入同序号回执）后不阻塞候选，
+    # 退避在 Python 侧按最新回执计算。
     rows = conn.execute(
         """
         SELECT d.delivery_id,
@@ -953,6 +958,15 @@ def claim_due_tasks(
                 WHERE l.delivery_id = d.delivery_id
                   AND l.mailbox = json_extract(je.value, '$.mailbox')
                   AND l.completed_at IS NULL AND l.lease_expires_at > ?
+                  -- 租约已被“不早于租约序号”的既有回执取代（如领取后回执接口
+                  -- 直接写入同序号回执，原令牌随即失效）时，该租约不再视为有效：
+                  -- 不阻塞候选，按最新回执重算到期时刻与下一尝试序号后可到期重领。
+                  AND NOT EXISTS (
+                        SELECT 1 FROM delivery_attempts a
+                        WHERE a.delivery_id = l.delivery_id
+                          AND a.mailbox = l.mailbox
+                          AND a.attempt_no >= l.attempt_no
+                  )
           )
           AND NOT EXISTS (
                 SELECT 1 FROM delivery_endpoint_revocations r
